@@ -1,0 +1,144 @@
+# ─── excel-to-markdown.yml ────────────────────────────────────────────────────
+# KDIQ GitHub Actions — Excel → Markdown conversion pipeline
+#
+# Trigger: any push that adds/changes a file under raw/**/*.xlsx
+#          (n8n W0 workflow pushes here, potentially many files in parallel)
+#
+# Concurrency strategy:
+#   group: kdiq-markdown-convert
+#   cancel-in-progress: false  ← QUEUE runs, never cancel
+#   This serialises the git-commit step so parallel W0 executions
+#   (one per MIS email) don't cause git push conflicts on the same repo.
+#
+# Steps:
+#   1. Install Microsoft MarkItDown (pip install markitdown[all])
+#   2. Detect the changed xlsx file
+#   3. Convert to Markdown → data/{market}/{date}/{stream}.md
+#   4. git pull --rebase then commit (safe even if another run just pushed)
+#   5. Upload .md as a workflow artifact (7-day retention)
+#   6. POST metadata to n8n W1 webhook so W1 pulls file and pushes to Drive
+#
+# Required GitHub Secrets (repo Settings → Secrets → Actions):
+#   N8N_W1_WEBHOOK_URL  — n8n W1 workflow webhook URL
+#   GITHUB_TOKEN        — auto-provided by Actions (no setup needed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: KDIQ Excel to Markdown
+
+on:
+  push:
+    paths:
+      - 'raw/**/*.xlsx'
+      - 'raw/**/*.xls'
+
+# Serialise ALL runs of this workflow so concurrent W0 pushes
+# don't produce simultaneous git commits that conflict.
+# cancel-in-progress: false means runs QUEUE — none are dropped.
+concurrency:
+  group: kdiq-markdown-convert
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    name: Convert Excel → Markdown
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # ── 2. Python + MarkItDown ───────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install MarkItDown (all extras for Excel support)
+        run: pip install 'markitdown[all]'
+
+      # ── 3. Detect changed xlsx ───────────────────────────────────────────────
+      - name: Detect changed xlsx file
+        id: find
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E '\.(xlsx|xls)$' | head -1)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No xlsx file in this push."
+            echo "found=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MARKET=$(echo "$CHANGED" | cut -d'/' -f2)
+          DATE=$(echo "$CHANGED"   | cut -d'/' -f3)
+          BASE=$(basename "$CHANGED" | sed 's/\.[^.]*$//')
+          MD="data/${MARKET}/${DATE}/${BASE}.md"
+
+          echo "found=true"         >> $GITHUB_OUTPUT
+          echo "xlsx_path=$CHANGED" >> $GITHUB_OUTPUT
+          echo "market=$MARKET"     >> $GITHUB_OUTPUT
+          echo "date=$DATE"         >> $GITHUB_OUTPUT
+          echo "basename=$BASE"     >> $GITHUB_OUTPUT
+          echo "md_path=$MD"        >> $GITHUB_OUTPUT
+
+          echo "Detected: $CHANGED → $MD"
+
+      # ── 4. Convert with MarkItDown ───────────────────────────────────────────
+      - name: Convert xlsx → Markdown
+        if: steps.find.outputs.found == 'true'
+        run: |
+          mkdir -p "$(dirname '${{ steps.find.outputs.md_path }}')"
+          markitdown '${{ steps.find.outputs.xlsx_path }}' > '${{ steps.find.outputs.md_path }}'
+          echo "Lines: $(wc -l < '${{ steps.find.outputs.md_path }}')"
+
+      # ── 5. Commit .md back to repo (rebase-safe) ────────────────────────────
+      # git pull --rebase handles the case where another serialised run
+      # committed between our checkout and now (shouldn't happen with the
+      # concurrency group, but this is a belt-and-suspenders safety net).
+      - name: Commit Markdown to repo
+        if: steps.find.outputs.found == 'true'
+        run: |
+          git config user.name  "KDIQ Bot"
+          git config user.email "kdiq@kals.co.in"
+
+          git add '${{ steps.find.outputs.md_path }}'
+
+          if git diff --staged --quiet; then
+            echo "Already up to date — skipping commit."
+          else
+            git pull --rebase origin main
+            git commit -m "KDIQ: ${{ steps.find.outputs.market }} ${{ steps.find.outputs.date }} markdown"
+            git push
+          fi
+
+      # ── 6. Upload artifact ───────────────────────────────────────────────────
+      - name: Upload Markdown artifact
+        if: steps.find.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "markdown-${{ steps.find.outputs.market }}-${{ steps.find.outputs.date }}"
+          path: "${{ steps.find.outputs.md_path }}"
+          retention-days: 7
+
+      # ── 7. Notify n8n W1 webhook ─────────────────────────────────────────────
+      - name: Notify W1 webhook
+        if: steps.find.outputs.found == 'true' && success()
+        run: |
+          curl -sf -X POST "${{ secrets.N8N_W1_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\":         \"markdown_ready\",
+              \"market\":        \"${{ steps.find.outputs.market }}\",
+              \"date\":          \"${{ steps.find.outputs.date }}\",
+              \"md_path\":       \"${{ steps.find.outputs.md_path }}\",
+              \"xlsx_path\":     \"${{ steps.find.outputs.xlsx_path }}\",
+              \"stream_id\":     \"${{ steps.find.outputs.basename }}\",
+              \"run_id\":        \"${{ github.run_id }}\",
+              \"artifact_name\": \"markdown-${{ steps.find.outputs.market }}-${{ steps.find.outputs.date }}\",
+              \"repo\":          \"${{ github.repository }}\"
+            }"
